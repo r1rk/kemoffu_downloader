@@ -432,38 +432,61 @@ class UpdateChecker(QThread):
             pass
 
 class CacheUpdateWorker(QThread):
-    finished_signal = pyqtSignal(list, list, dict)
+    finished_signal = pyqtSignal(list, list, dict, set)
 
-    def __init__(self, targets):
+    def __init__(self, targets, waf_cookies=None):
         super().__init__()
         self.targets = targets
+        self.waf_cookies = waf_cookies or {}  # {domain: "cookie_header"} Turnstile等を人間が突破済みのセッション
 
     def run(self):
         combined_cache = []
         error_messages = []
         site_counts = {}  # サイトごとの取得件数(成功したサイトのみキーが入る)
+        waf_suspected_domains = set()  # 403、またはJSON形状異常(チャレンジページ濃厚)だったドメイン
 
         for site_name, api_url in self.targets:
+            domain = re.sub(r'^https?://([^/]+)/.*$', r'\1', api_url)
             try:
-                req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                if domain in self.waf_cookies:
+                    # 人間がTurnstile等を実際に突破して得たセッションを使うことで、
+                    # 「正当な操作である」ことをそのCookie自体が証明する形でリクエストする
+                    headers['Cookie'] = self.waf_cookies[domain]
+                req = urllib.request.Request(api_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as res:
-                    data = json.loads(res.read().decode('utf-8'))
-                    if isinstance(data, list):
-                        # 各クリエイターデータに所属サイトの識別タグを論理的に付与
-                        for item in data:
-                            if isinstance(item, dict):
-                                item["_site"] = site_name
-                        combined_cache.extend(data)
-                        site_counts[site_name] = len(data)
-                    else:
-                        # JSONとしては読めたがリスト形式ではない = WAF/Turnstileのチャレンジ応答等、
-                        # 想定外のレスポンス。ここで無言でスキップすると「成功したサイトしか
-                        # 分からない」状態になるため、明示的にエラーとして記録する。
-                        error_messages.append(f"{site_name}(想定外の応答形式)" if CURRENT_LANG == "ja" else f"{site_name}(unexpected response format)")
+                    raw = res.read().decode('utf-8')
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    # JSONとして読めない = HTMLのチャレンジページ等が返ってきている可能性が高い。
+                    # WAFが必ずしも403を返すとは限らず、200 OKでチャレンジページを返すこともあるため、
+                    # ステータスコードだけでなくこのケースもWAF疑いとして扱う。
+                    error_messages.append(f"{site_name}(想定外の応答形式)" if CURRENT_LANG == "ja" else f"{site_name}(unexpected response format)")
+                    waf_suspected_domains.add(domain)
+                    continue
+
+                if isinstance(data, list):
+                    # 各クリエイターデータに所属サイトの識別タグを論理的に付与
+                    for item in data:
+                        if isinstance(item, dict):
+                            item["_site"] = site_name
+                    combined_cache.extend(data)
+                    site_counts[site_name] = len(data)
+                else:
+                    # JSONとしては読めたがリスト形式ではない = こちらもチャレンジ応答等の
+                    # 想定外のレスポンスである可能性が高いため、無言でスキップせず記録する。
+                    error_messages.append(f"{site_name}(想定外の応答形式)" if CURRENT_LANG == "ja" else f"{site_name}(unexpected response format)")
+                    waf_suspected_domains.add(domain)
+            except urllib.error.HTTPError as e:
+                error_messages.append(f"{site_name}({str(e)})")
+                if e.code == 403:
+                    waf_suspected_domains.add(domain)
             except Exception as e:
                 error_messages.append(f"{site_name}({str(e)})")
 
-        self.finished_signal.emit(combined_cache, error_messages, site_counts)
+        self.finished_signal.emit(combined_cache, error_messages, site_counts, waf_suspected_domains)
 
 class PreviewTaskSignals(QObject):
     log = pyqtSignal(str, str)
@@ -573,10 +596,10 @@ class PreviewDownloadWorker(QRunnable):
 class CreatorFetchSignals(QObject):
     finished = pyqtSignal(list)
     log = pyqtSignal(str, str)
-    waf_warning = pyqtSignal(str, str)
+    waf_warning = pyqtSignal(str, str, str, str, str, str)  # domain, error_text, target_url, service, user_id, extracted_name
 
 class CreatorFetchWorker(QRunnable):
-    def __init__(self, target_url, domain, service, user_id, extracted_name, max_retry=3):
+    def __init__(self, target_url, domain, service, user_id, extracted_name, max_retry=3, waf_cookies=None):
         super().__init__()
         self.target_url = target_url
         self.domain = domain
@@ -584,6 +607,7 @@ class CreatorFetchWorker(QRunnable):
         self.user_id = user_id
         self.extracted_name = extracted_name
         self.max_retry = max_retry  # 「高度な設定」タブの再試行回数(--retry)に追従(呼び出し元でメインスレッドから読んで渡す) 理由はこれを個別設定に分けるスペースがなかったので
+        self.waf_cookies = waf_cookies or {}  # {domain: "cookie_header"} Turnstile等を人間が突破済みのセッション
         self.signals = CreatorFetchSignals()
 
     def run(self):
@@ -605,17 +629,57 @@ class CreatorFetchWorker(QRunnable):
             # このページ(offset)単位で、個別インターバルを挟みながら再試行する。
             # 検索モードの画像取得と同じ方針: 429は0.5〜1秒、それ以外は0.1〜0.3秒。
             # QRunnable(バックグラウンドスレッド)内なのでtime.sleepで待ってもGUIはブロックしない。
+            is_waf_suspected = False
             while retry <= self.max_retry:
                 try:
-                    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    if self.domain in self.waf_cookies:
+                        # 人間がTurnstile等を実際に突破して得たセッションを使うことで、
+                        # 「正当な操作である」ことをそのCookie自体が証明する形でリクエストする
+                        headers['Cookie'] = self.waf_cookies[self.domain]
+                    req = urllib.request.Request(api_url, headers=headers)
                     with urllib.request.urlopen(req, timeout=10) as res:
-                        page_data = json.loads(res.read().decode('utf-8'))
+                        raw = res.read().decode('utf-8')
+
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        # JSONとして読めない = HTMLのチャレンジページ等が返ってきている可能性が高い
+                        last_error = e
+                        is_waf_suspected = True
+                        if retry >= self.max_retry:
+                            break
+                        time.sleep(random.uniform(0.1, 0.3))
+                        retry += 1
+                        continue
+
+                    if not isinstance(parsed, list):
+                        # JSONとしては読めたがリスト形式ではない = こちらもチャレンジ応答等の
+                        # 想定外のレスポンスの可能性が高い(そのままforで回すと落ちるため事前に弾く)
+                        last_error = ValueError("想定外の応答形式" if CURRENT_LANG == "ja" else "unexpected response format")
+                        is_waf_suspected = True
+                        if retry >= self.max_retry:
+                            break
+                        time.sleep(random.uniform(0.1, 0.3))
+                        retry += 1
+                        continue
+
+                    page_data = parsed
                     break
-                except Exception as e:
+                except urllib.error.HTTPError as e:
                     last_error = e
-                    is_429 = "429" in str(e)
+                    if e.code == 403:
+                        is_waf_suspected = True
                     if retry >= self.max_retry:
                         break
+                    delay = random.uniform(0.5, 1.0) if e.code == 429 else random.uniform(0.1, 0.3)
+                    time.sleep(delay)
+                    retry += 1
+                except Exception as e:
+                    last_error = e
+                    if retry >= self.max_retry:
+                        break
+                    is_429 = "429" in str(e)
                     delay = random.uniform(0.5, 1.0) if is_429 else random.uniform(0.1, 0.3)
                     time.sleep(delay)
                     retry += 1
@@ -628,8 +692,8 @@ class CreatorFetchWorker(QRunnable):
                     f"クリエイター情報の取得に失敗しました:[{creator_label}] 後ほど再試行してください。"
                     if CURRENT_LANG == "ja" else
                     f"Failed to fetch creator info: [{creator_label}] Please retry later.")
-                if last_error is not None and "403" in str(last_error):
-                    self.signals.waf_warning.emit(self.domain, str(last_error))
+                if is_waf_suspected:
+                    self.signals.waf_warning.emit(self.domain, str(last_error), self.target_url, self.service, self.user_id, self.extracted_name or "")
                 break
 
             if not page_data:
@@ -1697,24 +1761,31 @@ class WorkerProcess(QObject):
 
 class WafCheckDialog(QDialog):
     # 403が閾値を超えた際に、プロキシではなくサイト側のWAF/Turnstile等のアクセス制限を
-    # 疑うケース向けに、実際のブラウザエンジンでそのドメインを開いて人間が確認・突破できる
-    # ようにするための軽量ダイアログ。自動でチャレンジを解こうとするものではない。
-    # Claudeくんはこう書いてますがブラウザが立ち上がればおそらく甘い設定であれば自動で突破できるかと思われます
-    def __init__(self, domain, parent=None):
+    # 疑うケース向けのダイアログ。単に手動でブラウザを開かせるだけでなく、
+    # ユーザーが実際にTurnstile等を突破して得たセッションのCookieを取得し、
+    # それを以後の情報取得APIリクエストに使うことで「正当な操作であること」を証明する。
+    def __init__(self, domain, retry_callback=None, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.domain = domain
+        self.parent_gui = parent
+        self.retry_callback = retry_callback
         self.setWindowTitle(f"アクセス制限の確認 (WAF/Turnstile Check) - {domain}")
-        self.resize(1000, 720)
+        self.resize(1000, 760)
         layout = QVBoxLayout(self)
 
         info = QLabel(
             f"{domain} への情報取得(検索キャッシュ/クリエイター情報)が403エラーで失敗しました。\n"
             "サイト側のアクセス制限(WAF・Turnstile等)が働いている可能性があります。下のブラウザで\n"
-            "実際にサイトを開き、必要であればチェック(Turnstile等)を通過してから再試行してください。"
+            "実際にサイトを開き、必要であればチェック(Turnstile等)を通過してください。\n"
+            "通過できたら「セッションを取得して再試行」を押すと、そのブラウザで得たセッションを\n"
+            "使って情報取得を自動的にやり直します。"
             if CURRENT_LANG == "ja" else
             f"Fetching info from {domain} (search cache / creator info) failed with a 403 error.\n"
             "This may indicate a site-wide access restriction (WAF/Turnstile).\n"
-            "Use the browser below to open the site and pass any challenge if needed, then retry."
+            "Use the browser below to open the site and pass any challenge if needed.\n"
+            "Once passed, click \"Capture Session & Retry\" to automatically retry the request\n"
+            "using the session obtained in this browser."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1723,9 +1794,90 @@ class WafCheckDialog(QDialog):
         self.browser.setUrl(QUrl(f"https://{domain}/"))
         layout.addWidget(self.browser, 1)
 
-        btn_close = QPushButton("閉じる" if CURRENT_LANG == "ja" else "Close")
+        self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+
+        bottom_layout = QHBoxLayout()
+        self._retry_btn_default_text = "セッションを取得して再試行" if CURRENT_LANG == "ja" else "Capture Session & Retry"
+        self.btn_retry = QPushButton(self._retry_btn_default_text)
+        self.btn_retry.clicked.connect(self.extract_session_and_retry)
+        btn_close = QPushButton("閉じる(何もせず)" if CURRENT_LANG == "ja" else "Close (do nothing)")
         btn_close.clicked.connect(self.close)
-        layout.addWidget(btn_close)
+        bottom_layout.addWidget(self.btn_retry)
+        bottom_layout.addWidget(btn_close)
+        layout.addLayout(bottom_layout)
+
+    def extract_session_and_retry(self):
+        self.btn_retry.setEnabled(False)
+        self.btn_retry.setText("確認中..." if CURRENT_LANG == "ja" else "Checking...")
+        self._captured_cookies = []
+        self._cookies_done = False
+
+        # QWebEngineCookieStoreには「全件ロード完了」を通知するシグナルが存在しないため、
+        # CookieLoginDialogと同じデバウンス方式(cookieAddedが一定時間途絶えたら完了とみなす)にする。
+        self._cookie_quiet_timer = QTimer(self)
+        self._cookie_quiet_timer.setSingleShot(True)
+        self._cookie_quiet_timer.timeout.connect(self._finish_session_capture)
+
+        self._cookie_hard_limit_timer = QTimer(self)
+        self._cookie_hard_limit_timer.setSingleShot(True)
+        self._cookie_hard_limit_timer.timeout.connect(self._finish_session_capture)
+        self._cookie_hard_limit_timer.start(5000)
+
+        self.cookie_store = self.browser.page().profile().cookieStore()
+        self.cookie_store.cookieAdded.connect(self._on_cookie_added_for_session)
+        self.cookie_store.loadAllCookies()
+        self._cookie_quiet_timer.start(400)
+
+    def _on_cookie_added_for_session(self, cookie: QNetworkCookie):
+        # このダイアログで開いているドメインに関係するCookieだけを対象にする
+        # (cf_clearance等、Turnstile通過の証明になるCookieは基本的にそのドメイン自身に紐づく)
+        cookie_domain = cookie.domain().lstrip(".")
+        if cookie_domain == self.domain or self.domain.endswith("." + cookie_domain) or cookie_domain.endswith("." + self.domain):
+            self._captured_cookies.append(cookie)
+        if hasattr(self, "_cookie_quiet_timer"):
+            self._cookie_quiet_timer.start(400)  # 新着があるたびに静寂タイマーを延長
+
+    def _finish_session_capture(self):
+        if getattr(self, "_cookies_done", False):
+            return
+        self._cookies_done = True
+        self._cookie_quiet_timer.stop()
+        self._cookie_hard_limit_timer.stop()
+
+        if not self._captured_cookies:
+            self.lbl_status.setText(
+                "このドメインのCookieを取得できませんでした。チェックを通過してから、もう一度お試しください。"
+                if CURRENT_LANG == "ja" else
+                "No cookies were captured for this domain. Please pass the check first, then try again.")
+            self.btn_retry.setEnabled(True)
+            self.btn_retry.setText(self._retry_btn_default_text)
+            return
+
+        cookie_header = "; ".join(
+            f"{bytearray(c.name()).decode('utf-8', errors='ignore')}={bytearray(c.value()).decode('utf-8', errors='ignore')}"
+            for c in self._captured_cookies
+        )
+
+        if self.parent_gui is not None:
+            if not hasattr(self.parent_gui, "waf_cookies"):
+                self.parent_gui.waf_cookies = {}
+            self.parent_gui.waf_cookies[self.domain] = cookie_header
+            if hasattr(self.parent_gui, "log"):
+                self.parent_gui.log("SYS",
+                    f"{self.domain} の認証セッションを取得しました({len(self._captured_cookies)}個のCookie)。再試行します。"
+                    if CURRENT_LANG == "ja" else
+                    f"Captured an authenticated session for {self.domain} ({len(self._captured_cookies)} cookies). Retrying.")
+
+        if self.retry_callback:
+            try:
+                self.retry_callback()
+            except Exception as e:
+                if self.parent_gui is not None and hasattr(self.parent_gui, "log"):
+                    self.parent_gui.log("SYS", f"再試行の呼び出しに失敗しました: {e}" if CURRENT_LANG == "ja" else f"Failed to trigger retry: {e}")
+
+        self.close()
 
 class CookieLoginDialog(QDialog):
     def __init__(self, parent=None, is_auto_prompt=False):
@@ -2020,6 +2172,7 @@ class KemonoDLGUI(QMainWindow):
         self.config = {"skip_cookie_warning": False, "shortcut_prompt_shown": False}
         self.tray_icon = None
         self.all_creators_cache = []
+        self.waf_cookies = {}  # {domain: "name1=value1; name2=value2"} Turnstile等を人間が突破した際のセッションを保持
 
         self.init_ui()
         self.load_config()
@@ -2319,9 +2472,9 @@ link.Save
             self.cache_worker.terminate()
             self.cache_worker.wait()
 
-        self.cache_worker = CacheUpdateWorker(target_apis)
+        self.cache_worker = CacheUpdateWorker(target_apis, waf_cookies=self.waf_cookies)
         
-        def on_worker_finished(combined_cache, error_messages, site_counts):
+        def on_worker_finished(combined_cache, error_messages, site_counts, waf_suspected_domains):
             if combined_cache:
                 self.search_cache = combined_cache
                 try:
@@ -2346,10 +2499,13 @@ link.Save
                     reason_text = fail_reason.split("(", 1)[1] if fail_reason else ")"  # "サイト名(理由)" の"(理由)"部分だけを取り出す
                     label = "失敗" if CURRENT_LANG == "ja" else "failed"
                     part = f"{site_name}:{label}({reason_text}" if fail_reason else f"{site_name}:{label}(不明{reason_text}" if CURRENT_LANG == "ja" else f"{site_name}:{label}(unknown{reason_text}"
-                    # 情報取得APIが403で失敗した場合、サイト側のアクセス制限(WAF/Turnstile)を疑い
-                    # 手動確認できるブラウザを提示する(ダウンロード中には出さない方針)
-                    if fail_reason and "403" in fail_reason:
-                        self.check_waf_and_offer_browser(site_domains.get(site_name, ""), fail_reason)
+                    # 情報取得APIが403で失敗、またはチャレンジページ濃厚な想定外の応答だった場合、
+                    # サイト側のアクセス制限(WAF/Turnstile)を疑い手動確認できるブラウザを提示する
+                    # (ダウンロード中には出さない方針)。文字列一致ではなく、ワーカー側で明示的に
+                    # 判定したwaf_suspected_domainsを使う(200 OKでチャレンジページが返るケースも拾える)。
+                    site_domain = site_domains.get(site_name, "")
+                    if site_domain in waf_suspected_domains:
+                        self.check_waf_and_offer_browser(site_domain, fail_reason or "", lambda: self.init_creator_cache(force=True))
                 breakdown_parts.append(part)
             breakdown = " / ".join(breakdown_parts)
             
@@ -2990,10 +3146,11 @@ link.Save
                 ext_name = fetch_creator_name(u)
                 self.active_api_fetches += 1
                 worker = CreatorFetchWorker(u, domain, service, user_id, ext_name,
-                                             max_retry=self.widgets_map["--retry"]["widget"].value())
+                                             max_retry=self.widgets_map["--retry"]["widget"].value(),
+                                             waf_cookies=self.waf_cookies)
                 worker.signals.log.connect(self.log)
                 worker.signals.finished.connect(self.on_creator_fetched)
-                worker.signals.waf_warning.connect(self.check_waf_and_offer_browser)
+                worker.signals.waf_warning.connect(self.on_creator_fetch_waf_warning)
                 self.api_pool.start(worker)
             else:
                 task_id = hashlib.md5(u.encode('utf-8')).hexdigest()[:8]
@@ -3270,11 +3427,14 @@ link.Save
             worker_proc.active_preview_tasks -= 1
             worker_proc.check_and_finalize()
 
-    def check_waf_and_offer_browser(self, domain, error_text):
+    def check_waf_and_offer_browser(self, domain, error_text, retry_callback=None):
         # 検索キャッシュ取得・クリエイター情報の事前取得など、「情報取得APIそのものが
         # 動作しない」場面専用。ダウンロード中(WorkerProcess)には意図的に組み込まない
         # (ダウンロードのたびに手動でTurnstileを解かされるのは体験として不満が残るため)。
-        if not domain or "403" not in error_text:
+        # WAF疑いかどうかの判定自体は呼び出し元(403 HTTPError、またはJSON形状異常)で
+        # 既に行っているため、ここでは判定を繰り返さない(200 OKでチャレンジページが
+        # 返るケースは文字列に"403"が含まれないため、ここで再度弾くと拾えなくなる)。
+        if not domain:
             return
         # 同一ドメインについて短時間に何度もダイアログを出さないようクールダウンを設ける
         now = time.time()
@@ -3285,15 +3445,31 @@ link.Save
 
         if not HAS_WEBENGINE:
             self.log("SYS",
-                f"{domain} への情報取得APIが403で失敗しました。サイト側のアクセス制限(WAF/Turnstile)の可能性があります。"
+                f"{domain} への情報取得APIが失敗しました({error_text})。サイト側のアクセス制限(WAF/Turnstile)の可能性があります。"
                 "(ブラウザでの手動確認にはPyQt6-WebEngineが必要です: pip install PyQt6-WebEngine)"
                 if CURRENT_LANG == "ja" else
-                f"API request to {domain} failed with 403. This may be a site-wide WAF/Turnstile block. "
+                f"API request to {domain} failed ({error_text}). This may be a site-wide WAF/Turnstile block. "
                 "(PyQt6-WebEngine is required to open a browser: pip install PyQt6-WebEngine)")
             return
 
-        dlg = WafCheckDialog(domain, self)
+        dlg = WafCheckDialog(domain, retry_callback, self)
         dlg.show()
+
+    def on_creator_fetch_waf_warning(self, domain, error_text, target_url, service, user_id, extracted_name):
+        retry_callback = lambda: self._resubmit_creator_fetch(target_url, domain, service, user_id, extracted_name)
+        self.check_waf_and_offer_browser(domain, error_text, retry_callback)
+
+    def _resubmit_creator_fetch(self, target_url, domain, service, user_id, extracted_name):
+        # WafCheckDialogでセッションを取得した後、同じクリエイターの情報取得をもう一度投げ直す。
+        # この時点ではself.waf_cookiesに新しいCookieが入っているので、今度は認証済みとして通るはず。
+        self.active_api_fetches += 1
+        worker = CreatorFetchWorker(target_url, domain, service, user_id, extracted_name,
+                                     max_retry=self.widgets_map["--retry"]["widget"].value(),
+                                     waf_cookies=self.waf_cookies)
+        worker.signals.log.connect(self.log)
+        worker.signals.finished.connect(self.on_creator_fetched)
+        worker.signals.waf_warning.connect(self.on_creator_fetch_waf_warning)
+        self.api_pool.start(worker)
 
     def on_worker_finished(self, task_id, task, success, skipped_never_imported):
         worker = self.active_workers.pop(task_id, None)
