@@ -55,9 +55,9 @@ def is_newer_version(latest, current):
         return _version_tuple(latest) > _version_tuple(current)
     except Exception:
         return False
-
-CURRENT_VERSION = "1.0.0"
-UPDATE_JSON_URL = "https://raw.githubusercontent.com/kemono-dl-gui/update/main/update.json"
+      
+CURRENT_VERSION = "1.0.2"
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/r1rk/kemoffu_downloader/refs/heads/main/update.json"
 
 # 実行時のカレントディレクトリ(CWD)に依存させないためのアプリ基準ディレクトリ。
 # PyInstaller等でexe化されている場合はexeの場所、そうでなければこのスクリプトの場所を基準にする。
@@ -145,8 +145,8 @@ TEXTS = {
         "msg_kemono_dl_missing": "kemono-dl.py が見つかりませんでした。\n動作に必要な kemono-dl.py（およびsrcフォルダ）がある場所を指定してください。",
         "msg_kemono_dl_missing_title": "kemono-dl.py の場所を指定",
         "msg_kemono_dl_src_missing": "選択された場所に、動作に必要な src フォルダが見つかりませんでした。\nこのまま続行しますか？（正しく動作しない可能性があります）",
-        "msg_merge_start": "全てのダウンロードが完了しました。指定フォルダへ一括マージ(移動)しています...",
-        "msg_merge_done": "指定フォルダへの一括マージが完了しました。",
+        "msg_merge_start": "全てのダウンロードが完了しました。指定フォルダへ移動しています...（時間がかかる場合がございます）",
+        "msg_merge_done": "指定フォルダへの移動が完了しました。",
         "msg_merge_err": "フォルダマージ中にエラーが発生しました:",
         "msg_proxy_dead": "プロキシの応答不能またはアクセス制限を検知。プロセスを強制終了します。",
         "msg_retry_auto": "警告: 未インポート(never imported)でスキップされました。強制取得モードで自動再試行します。",
@@ -1701,7 +1701,10 @@ class WorkerProcess(QObject):
 
     def check_and_finalize(self):
         if not self.cli_finished: return
-        if self.active_preview_tasks > 0: return 
+        if self.active_preview_tasks > 0: return
+
+        self._finalized = True
+        self.watchdog_timer.stop()
         
         success = self.success
         if not success and self.skipped_never_imported:
@@ -1744,6 +1747,7 @@ class WorkerProcess(QObject):
                 self.log_signal.emit(self.task_id, f"Resume Failed: {e}")
 
     def check_stall(self):
+        if self.cli_finished: return
         if time.time() - self.last_progress_time > 30:
             self.log_signal.emit(self.task_id, "通信のタイムアウトを検知しました。プロセスを再起動します。" if CURRENT_LANG == "ja" else "Network stall detected. Restarting process.")
             self.proxy_dead = True
@@ -3334,7 +3338,7 @@ link.Save
     def finish_all_tasks(self):
         from PyQt6.QtWidgets import QSystemTrayIcon
         self.log("SYS", L("msg_done"))
-        self.stop_all()
+        self.stop_all(auto_finish=True)
         self.refresh_history()
         
         if self.widgets_map.get("--desktop-notify", {}).get("widget", QCheckBox()).isChecked():
@@ -3575,21 +3579,32 @@ link.Save
         except Exception as e:
             self.log("SYS", f"レポート出力エラー: {e}" if CURRENT_LANG == "ja" else f"Report output error: {e}")
 
-    def stop_all(self):
+    def stop_all(self, auto_finish=False):
+        is_auto = (auto_finish is True)
+
+        # 1. キュータイマーと実行フラグの停止
         self.queue_timer.stop()
         self.is_running = False
+
+        # 2. 自動完了時以外のみ「安全に停止しています...」ログを出力
+        if not is_auto:
+            self.log("SYS", L("msg_stop"))
+
+        # 3. 動作中の全ワーカーを一時停止解除した上で確実に停止
+        for worker in list(self.active_workers.values()):
+            if self.is_paused:
+                worker.resume()
+            worker.stop()
+
+        # 4. 一時停止状態のリセットとプロキシレポートの出力
+        self.is_paused = False
+        self.btn_pause.setText(L("btn_pause"))
+        self.write_proxy_report()
+
+        # 5. ボタンUIの状態更新（最後にまとめて反映）
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
-
-        self.log("SYS", L("msg_stop"))
-        for worker in list(self.active_workers.values()):
-            if self.is_paused: worker.resume()
-            worker.stop()
-
-        self.btn_pause.setText(L("btn_pause"))
-        self.is_paused = False
-        self.write_proxy_report()
 
 if __name__ == '__main__':
     from PyQt6.QtGui import QPixmap, QColor
