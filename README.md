@@ -495,7 +495,7 @@ Kemono / Pawchive間のお気に入り移行機能を実装する際の参考と
 **Kemoffu Downloader**
 
 GUIによって `kemono-dl` を扱いやすくすることを目的として開発しています。
-# `requirements.txt`
+### `requirements.txt`
 
 ```text
 PyQt6
