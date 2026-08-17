@@ -3771,6 +3771,13 @@ if __name__ == '__main__':
     
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
+
+    # アプリケーションアイコン
+    # EXEのアイコンとは別に、Qt側のウィンドウ/タスクバーアイコンとして設定する。
+    app_icon_path = app_path("kemoffu_icon.ico")
+    app_icon = QIcon(app_icon_path)
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     
     # CWD(カレントディレクトリ)依存だと、exeと別の作業フォルダから起動された場合や
     # PyInstaller --onefile 展開時に画像が見つからなくなるため、APP_DIR基準の絶対パスにする。
@@ -3778,13 +3785,15 @@ if __name__ == '__main__':
     original_pixmap = QPixmap(splash_image_path)
     
     if not original_pixmap.isNull():
-        pixmap = original_pixmap.scaled(700, 400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pixmap = original_pixmap.scaled(
+            700, 400,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
     else:
         pixmap = QPixmap(600, 350)
         pixmap.fill(QColor("#2b2b2b"))
         
-    # スプラッシュ入れて体感起動のUX速くしてみたり
-
     splash = QSplashScreen(pixmap, Qt.WindowType.WindowStaysOnTopHint)
     splash.show()
     
