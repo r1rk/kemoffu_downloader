@@ -472,9 +472,9 @@ WAF等の確認が必要な場合は、GUIのWAF確認機能も利用できま�
 
 ### kemono-dl
 
-[AlphaSlayer1964](https://github.com/AlphaSlayer1964) のフォークを作成した **L4Cache** 氏による `kemono-dl`。
+[AlphaSlayer1964](https://github.com/AlphaSlayer1964) のフォークを作成した **L4Cache** 氏による [kemono-dl](https://github.com/L4cache/kemono-dl)。
 
-本ツールでは `kemono-dl` をダウンロード処理のCLIエンジンとして利用しています。
+本ツールでは `kemono-dl` をダウンロード処理のCLIエンジンとして利用しています。その為こちらのダウンロードは**必須**です。zipファイルを[ここ](https://github.com/L4cache/kemono-dl/archive/refs/heads/main.zip)から落として解凍してください。
 
 ### Kemono → Pawchive お引っ越しツール
 
