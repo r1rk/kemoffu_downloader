@@ -17,6 +17,16 @@ The actual download process is handled by the `kemono-dl` CLI engine. On top of 
 
 ## Features
 
+### ⚡ High-Speed Parallel Downloads
+
+Kemoffu can process multiple download tasks in parallel, significantly reducing the time required compared with the sequential download process of `kemono-dl`.
+
+In our development testing, downloads that could take **more than ten hours** depending on the content and environment were reduced to approximately **15–30 minutes**.
+
+Kemoffu also supports downloading through proxies. Combined with parallel downloads, this has been tested to reach **near the maximum available bandwidth on 400–500 Mbps-class internet connections**.
+
+> ※ Actual download speeds and completion times vary depending on network conditions, the target site, proxy performance, the number of concurrent tasks, file sizes, and other factors.
+
 ### 🚀 Download & Task Management
 
 - **Batch URL processing**: Enter multiple URLs, one per line. Drag-and-drop URL input is also supported.
