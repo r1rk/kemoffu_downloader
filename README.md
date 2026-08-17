@@ -498,8 +498,9 @@ GUIによって `kemono-dl` を扱いやすくすることを目的として開�
 ### `requirements.txt`
 
 ```text
-PyQt6
-psutil
+PyQt6~=6.6.0
+PyQt6-WebEngine~=6.6.0
+psutil~=5.9.8
 beautifulsoup4>=4.12.3
 Pillow>=10.4.0
 requests>=2.32.3
