@@ -71,7 +71,7 @@ def is_newer_version(latest, current):
     except Exception:
         return False
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.3"
 UPDATE_JSON_URL = "https://raw.githubusercontent.com/kemono-dl-gui/update/main/update.json"
 
 # 実行時のカレントディレクトリ(CWD)に依存させないためのアプリ基準ディレクトリ。
