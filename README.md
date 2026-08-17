@@ -503,5 +503,4 @@ psutil
 beautifulsoup4>=4.12.3
 Pillow>=10.4.0
 requests>=2.32.3
-
 ````
