@@ -38,6 +38,21 @@ try:
 except ImportError:
     HAS_WEBENGINE = False
 
+# 注意(exe化時): importに成功して HAS_WEBENGINE=True になっていても、
+# PyInstaller等でexe化する際にQtWebEngineが必要とするリソース
+# (locales, icudtl.dat, QtWebEngineProcess本体など)が正しく同梱されていないと、
+# 実際に QWebEngineView() を生成した瞬間に例外や別プロセスのクラッシュが起きることがある。
+# ビルド時は `--collect-all PyQt6` 等でWebEngine関連のデータファイルを
+# 明示的に同梱すること。ここでは万一それでも失敗した場合に備え、
+# アプリ全体を巻き込んで落ちないよう例外を捕まえるヘルパーを用意する。
+def try_create_webview():
+    if not HAS_WEBENGINE:
+        return None
+    try:
+        return QWebEngineView()
+    except Exception:
+        return None
+
 # わかりやすそうなコメントはClaudeくんやGeminiくんのものもそのまま残しています
 # 私的メモも置いてると逆に分かりにくくなりそうな部分以外はあえて残しています
 
@@ -55,19 +70,58 @@ def is_newer_version(latest, current):
         return _version_tuple(latest) > _version_tuple(current)
     except Exception:
         return False
-      
-CURRENT_VERSION = "1.0.2"
-UPDATE_JSON_URL = "https://raw.githubusercontent.com/r1rk/kemoffu_downloader/refs/heads/main/update.json"
+
+CURRENT_VERSION = "1.0.0"
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/kemono-dl-gui/update/main/update.json"
 
 # 実行時のカレントディレクトリ(CWD)に依存させないためのアプリ基準ディレクトリ。
 # PyInstaller等でexe化されている場合はexeの場所、そうでなければこのスクリプトの場所を基準にする。
-if getattr(sys, 'frozen', False):
+IS_FROZEN = bool(getattr(sys, 'frozen', False))
+
+# --noconsole(windowed)でexe化すると、Windows環境ではsys.stdout/sys.stderrが
+# None になることがある(PyInstallerのバージョンや環境依存)。
+# この状態で万一 print() 等が呼ばれると "'NoneType' object has no attribute 'write'"
+# で例外になり、意図しない場所でクラッシュ/エラーダイアログの原因になる。
+# コード側で print() を極力使わない方針だが、保険として起動時にダミーの
+# 書き込み先へ差し替えておく。
+if IS_FROZEN:
+    class _NullWriter:
+        def write(self, *a, **k): pass
+        def flush(self, *a, **k): pass
+    if sys.stdout is None:
+        sys.stdout = _NullWriter()
+    if sys.stderr is None:
+        sys.stderr = _NullWriter()
+
+if IS_FROZEN:
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def app_path(*parts):
     return os.path.join(APP_DIR, *parts)
+
+# --- kemono-dl.py 起動コマンドの組み立て ------------------------------------
+# 重要: exe化(PyInstaller等)すると sys.executable は「Pythonインタプリタ」ではなく
+# 「自分自身(このGUIのexe)」を指すようになる。そのため素朴に
+#     QProcess.start(sys.executable, [kemono_dl_path] + args)
+# としてしまうと、exe化後は kemono-dl.py が実行されず、
+# 自分自身(GUI)がもう1つ余計な引数付きで多重起動されてしまう(実際に報告のあった不具合)。
+#
+# 対策として、
+#   1) kemono_dl_path が .py の場合は「別途用意したPythonインタプリタ」で実行する
+#      (スクリプト実行中は sys.executable がそのままPythonなのでそれを使う。
+#       exe化後は resolve_python_executable() で明示的に見つけたPythonを使う)
+#   2) kemono_dl_path が .exe/.bat/.cmd 等、それ自体が実行可能な場合は
+#      Pythonを介さず直接実行する(kemono-dl側もexe化して配布するケースに対応)
+def build_launch_command(kemono_dl_path, python_executable=None):
+    """QProcess.start()に渡す (program, prefix_args) を返す。
+    戻り値の prefix_args は、呼び出し側で追加の引数リストの先頭に連結する。
+    """
+    if kemono_dl_path and kemono_dl_path.lower().endswith(('.exe', '.bat', '.cmd')):
+        return kemono_dl_path, []
+    prog = python_executable or sys.executable
+    return prog, [kemono_dl_path]
 
 # app_path(APP_DIR)は「exeやスクリプト本体が置かれている場所」なので、
 # kemono-dl.py本体の探索など読み取り専用の用途には引き続き使う。
@@ -145,6 +199,9 @@ TEXTS = {
         "msg_kemono_dl_missing": "kemono-dl.py が見つかりませんでした。\n動作に必要な kemono-dl.py（およびsrcフォルダ）がある場所を指定してください。",
         "msg_kemono_dl_missing_title": "kemono-dl.py の場所を指定",
         "msg_kemono_dl_src_missing": "選択された場所に、動作に必要な src フォルダが見つかりませんでした。\nこのまま続行しますか？（正しく動作しない可能性があります）",
+        "msg_python_missing": "kemono-dl.py (Pythonスクリプト) を実行するためのPython本体が見つかりませんでした。\nPythonのインストール場所(python.exe)を指定してください。",
+        "msg_python_missing_title": "Python本体の場所を指定",
+        "msg_webengine_unavailable": "内蔵ブラウザ機能(QtWebEngine)を初期化できませんでした。\nexe化されている場合は、ビルド時にQtWebEngine関連のリソースが正しく同梱されているかご確認ください。",
         "msg_merge_start": "全てのダウンロードが完了しました。指定フォルダへ移動しています...（時間がかかる場合がございます）",
         "msg_merge_done": "指定フォルダへの移動が完了しました。",
         "msg_merge_err": "フォルダマージ中にエラーが発生しました:",
@@ -202,6 +259,9 @@ TEXTS = {
         "msg_kemono_dl_missing": "kemono-dl.py could not be found.\nPlease locate the folder containing kemono-dl.py (and its required src folder).",
         "msg_kemono_dl_missing_title": "Locate kemono-dl.py",
         "msg_kemono_dl_src_missing": "The required 'src' folder was not found next to the selected file.\nContinue anyway? (It may not work correctly.)",
+        "msg_python_missing": "Could not find a Python interpreter to run kemono-dl.py.\nPlease locate your python.exe.",
+        "msg_python_missing_title": "Locate Python executable",
+        "msg_webengine_unavailable": "Failed to initialize the built-in browser (QtWebEngine).\nIf this is a packaged .exe build, please check that QtWebEngine's resource files were bundled correctly at build time.",
         "msg_merge_start": "All downloads completed. Merging files to the destination folder...",
         "msg_merge_done": "Files successfully merged to the destination folder.",
         "msg_merge_err": "Error during folder merge:",
@@ -554,7 +614,10 @@ class PreviewDownloadWorker(QRunnable):
             
             if not paths: return
             
-            user_folder = self.dirname_pattern.replace("{service}", self.service)\
+            # ドライブレター（D:等）や先頭のスラッシュを除去して相対パス化
+            safe_dirname_pattern = re.sub(r'^[a-zA-Z]:', '', self.dirname_pattern).lstrip('\\/')
+            
+            user_folder = safe_dirname_pattern.replace("{service}", self.service)\
                                               .replace("{username}", self.sanitize_filename(self.username))\
                                               .replace("{user_id}", self.user_id)
             # ここで扱えるのは {service}/{username}/{user_id} の3つのみ。
@@ -801,7 +864,11 @@ class MiniBrowserDialog(QDialog):
         self.resize(1050, 750)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
-        self.webview = QWebEngineView()
+        self.webview = try_create_webview()
+        if self.webview is None:
+            QMessageBox.warning(self, L("dlg_warn"), L("msg_webengine_unavailable"))
+            QTimer.singleShot(0, self.reject)
+            return
         self.webview.setUrl(QUrl(url))
         layout.addWidget(self.webview)
 
@@ -1514,7 +1581,7 @@ class WorkerProcess(QObject):
     finished_signal = pyqtSignal(str, dict, bool, bool)
     preview_signal = pyqtSignal(str, str, str, str, str, str, str, str)
 
-    def __init__(self, task, proxy, base_args, is_custom_dest, final_dest_dir, dirname_pattern, fetch_previews=False, kemono_dl_path=None):
+    def __init__(self, task, proxy, base_args, is_custom_dest, final_dest_dir, dirname_pattern, fetch_previews=False, kemono_dl_path=None, python_executable=None):
         super().__init__()
         self.task = task
         self.task_id = task["id"]
@@ -1526,6 +1593,10 @@ class WorkerProcess(QObject):
         self.dirname_pattern = dirname_pattern
         self.fetch_previews = fetch_previews
         self.kemono_dl_path = kemono_dl_path or app_path("kemono-dl.py")
+        # exe化されている場合、sys.executableは自分自身(このGUI)を指してしまうため、
+        # 呼び出し元(KemonoDLGUI.resolve_python_executable)で明示的に解決したPythonパスを
+        # 受け取って使う。未指定(スクリプト実行時など)ならsys.executableをそのまま使う。
+        self.python_executable = python_executable or sys.executable
         
         self.current_domain = "kemono.cr"
         self.current_service = None
@@ -1604,7 +1675,9 @@ class WorkerProcess(QObject):
         
         script_dir = os.path.dirname(self.kemono_dl_path) or APP_DIR
         self.process.setWorkingDirectory(script_dir)
-        self.process.start(sys.executable, [self.kemono_dl_path] + args)
+
+        program, prefix_args = build_launch_command(self.kemono_dl_path, self.python_executable)
+        self.process.start(program, prefix_args + args)
         self.watchdog_timer.start(5000)
 
     def handle_output(self):
@@ -1794,7 +1867,11 @@ class WafCheckDialog(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.browser = QWebEngineView()
+        self.browser = try_create_webview()
+        if self.browser is None:
+            QMessageBox.warning(self, L("dlg_warn"), L("msg_webengine_unavailable"))
+            QTimer.singleShot(0, self.reject)
+            return
         self.browser.setUrl(QUrl(f"https://{domain}/"))
         layout.addWidget(self.browser, 1)
 
@@ -1918,7 +1995,11 @@ class CookieLoginDialog(QDialog):
         nav_layout.addWidget(btn_p_reg, 0, 5)
         layout.addLayout(nav_layout)
 
-        self.webview = QWebEngineView()
+        self.webview = try_create_webview()
+        if self.webview is None:
+            QMessageBox.warning(self, L("dlg_warn"), L("msg_webengine_unavailable"))
+            QTimer.singleShot(0, self.reject)
+            return
         self.profile = QWebEngineProfile.defaultProfile()
         self.webview.setUrl(QUrl("https://kemono.cr/authentication/login"))
         layout.addWidget(self.webview, 1)
@@ -2024,7 +2105,11 @@ class MigrationDialog(QDialog):
             nav_layout.addWidget(btn)
         left_layout.addLayout(nav_layout)
         
-        self.browser = QWebEngineView()
+        self.browser = try_create_webview()
+        if self.browser is None:
+            QMessageBox.warning(self, L("dlg_warn"), L("msg_webengine_unavailable"))
+            QTimer.singleShot(0, self.reject)
+            return
         self.browser.setUrl(QUrl("https://kemono.cr/"))
         left_layout.addWidget(self.browser)
         
@@ -2241,16 +2326,34 @@ class KemonoDLGUI(QMainWindow):
         try:
             desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
             path = os.path.join(desktop, 'Kemono-DL GUI.lnk')
-            target = sys.executable
-            args = os.path.abspath(sys.argv[0])
-            work_dir = os.path.dirname(args)
+
+            if IS_FROZEN:
+                # exe化されている場合、sys.executable も sys.argv[0] も
+                # どちらも「自分自身のexe」を指す。
+                # ここでargsに自分自身のパスを入れてしまうと、
+                # 「自分自身に自分自身のパスを引数として渡す」誤ったショートカットになり、
+                # 引数として渡されたパスが原因で意図しない多重起動・誤動作の元になる。
+                # exeは単体で完結しているのでargsは空でよい。
+                target = sys.executable
+                args = ""
+                work_dir = APP_DIR
+            else:
+                # スクリプト実行中は「python.exe + スクリプトパス」で起動する
+                target = sys.executable
+                args = os.path.abspath(sys.argv[0])
+                work_dir = os.path.dirname(args)
+
+            # VBScriptの文字列リテラル内でダブルクォートが含まれるとスクリプトが壊れるため、
+            # ダブルクォートを2つ重ねてエスケープする(VBSの仕様)。
+            def _vbs_escape(s):
+                return s.replace('"', '""')
 
             vbs_script = f'''
 Set ws = WScript.CreateObject("WScript.Shell")
-Set link = ws.CreateShortcut("{path}")
-link.TargetPath = "{target}"
-link.Arguments = "{args}"
-link.WorkingDirectory = "{work_dir}"
+Set link = ws.CreateShortcut("{_vbs_escape(path)}")
+link.TargetPath = "{_vbs_escape(target)}"
+link.Arguments = "{_vbs_escape(args)}"
+link.WorkingDirectory = "{_vbs_escape(work_dir)}"
 link.Save
 '''
             vbs_path = os.path.join(work_dir, "temp_create_shortcut.vbs")
@@ -3046,29 +3149,77 @@ link.Save
             return saved_path
 
         # 2) デフォルトの配置場所（GUI本体と同じフォルダ）
-        default_path = app_path("kemono-dl.py")
-        if os.path.exists(default_path):
-            return default_path
+        #    kemono-dl.py(スクリプト版)だけでなく、kemono-dl.exe(コンパイル済み版)が
+        #    置かれているケースにも対応する。
+        for default_name in ("kemono-dl.py", "kemono-dl.exe"):
+            default_path = app_path(default_name)
+            if os.path.exists(default_path):
+                return default_path
 
         # 3) どちらにも無い場合はユーザーに手動で場所を指定してもらう
         QMessageBox.warning(self, L("dlg_warn"), L("msg_kemono_dl_missing"))
         chosen, _ = QFileDialog.getOpenFileName(
-            self, L("msg_kemono_dl_missing_title"), APP_DIR, "Python Files (*.py);;All Files (*)"
+            self, L("msg_kemono_dl_missing_title"), APP_DIR,
+            "kemono-dl (*.py *.exe);;Python Files (*.py);;Executable (*.exe);;All Files (*)"
         )
         if not chosen:
             return None
 
         chosen = os.path.abspath(chosen)
-        src_dir = os.path.join(os.path.dirname(chosen), "src")
-        if not os.path.isdir(src_dir):
-            reply = QMessageBox.question(
-                self, L("dlg_warn"), L("msg_kemono_dl_src_missing"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return None
+
+        # srcフォルダの存在チェックは「Pythonスクリプトとして動かす場合」にのみ意味があるので、
+        # .exeを選んだ場合はスキップする(単体exe内に同梱されている想定)。
+        if chosen.lower().endswith('.py'):
+            src_dir = os.path.join(os.path.dirname(chosen), "src")
+            if not os.path.isdir(src_dir):
+                reply = QMessageBox.question(
+                    self, L("dlg_warn"), L("msg_kemono_dl_src_missing"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.No:
+                    return None
 
         self.config["kemono_dl_path"] = chosen
+        self.save_config()
+        return chosen
+
+    def resolve_python_executable(self, kemono_dl_path):
+        # kemono-dl側が.exe(コンパイル済み)の場合はPython不要
+        if kemono_dl_path and kemono_dl_path.lower().endswith(('.exe', '.bat', '.cmd')):
+            return None
+
+        # スクリプト実行中(exe化されていない)なら、今動いているPython自身をそのまま使えばよい
+        if not IS_FROZEN:
+            return sys.executable
+
+        # ここに来るのは「このGUI自体はexe化されているが、kemono-dl.pyはPythonスクリプトのまま」
+        # というケース。exe化されたGUIの sys.executable は自分自身を指すため使えず、
+        # 別途Pythonインタプリタの場所を明示的に解決する必要がある。
+
+        # 1) 前回保存したPythonパスがあれば優先
+        saved = self.config.get("python_executable", "")
+        if saved and os.path.exists(saved):
+            return saved
+
+        # 2) PATH上のpython/py launcherを探す
+        for candidate in ("python", "python3", "py"):
+            found = shutil.which(candidate)
+            if found:
+                self.config["python_executable"] = found
+                self.save_config()
+                return found
+
+        # 3) 見つからない場合はユーザーに手動で指定してもらう
+        QMessageBox.warning(self, L("dlg_warn"), L("msg_python_missing"))
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, L("msg_python_missing_title"), APP_DIR,
+            "Python (python.exe pythonw.exe);;All Files (*)"
+        )
+        if not chosen:
+            return None
+
+        chosen = os.path.abspath(chosen)
+        self.config["python_executable"] = chosen
         self.save_config()
         return chosen
 
@@ -3077,6 +3228,12 @@ link.Save
         if not kemono_dl_path:
             return
         self.kemono_dl_path = kemono_dl_path
+
+        python_executable = self.resolve_python_executable(kemono_dl_path)
+        # .py実行なのにPythonが見つからなかった場合は開始できないので中断する
+        if kemono_dl_path.lower().endswith('.py') and not python_executable:
+            return
+        self.python_executable = python_executable
 
         urls_text = self.text_urls.toPlainText()
         
@@ -3293,7 +3450,8 @@ link.Save
             worker = WorkerProcess(
                 task, assigned_proxy, self.base_cli_args,
                 is_custom_dest, final_dest_dir, dirname_pattern, fetch_previews,
-                kemono_dl_path=getattr(self, 'kemono_dl_path', None)
+                kemono_dl_path=getattr(self, 'kemono_dl_path', None),
+                python_executable=getattr(self, 'python_executable', None)
             )
             worker.log_signal.connect(self.log)
             worker.progress_signal.connect(self.update_task_progress)
@@ -3345,7 +3503,7 @@ link.Save
             if QSystemTrayIcon.isSystemTrayAvailable():
                 if not hasattr(self, "tray_icon") or not self.tray_icon:
                     self.tray_icon = QSystemTrayIcon(self)
-                    icon_pixmap = QPixmap("kemoffu_logo.png")
+                    icon_pixmap = QPixmap(app_path("kemoffu_logo.png"))
                     if icon_pixmap.isNull():
                         icon_pixmap = QPixmap(64, 64)
                         icon_pixmap.fill(QColor("#4CAF50"))
@@ -3614,7 +3772,9 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
     
-    splash_image_path = "kemoffu_logo.png"
+    # CWD(カレントディレクトリ)依存だと、exeと別の作業フォルダから起動された場合や
+    # PyInstaller --onefile 展開時に画像が見つからなくなるため、APP_DIR基準の絶対パスにする。
+    splash_image_path = app_path("kemoffu_logo.png")
     original_pixmap = QPixmap(splash_image_path)
     
     if not original_pixmap.isNull():
