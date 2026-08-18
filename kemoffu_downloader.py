@@ -72,7 +72,7 @@ def is_newer_version(latest, current):
         return False
 
 CURRENT_VERSION = "1.0.3"
-UPDATE_JSON_URL = "https://raw.githubusercontent.com/kemono-dl-gui/update/main/update.json"
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/r1rk/kemoffu_downloader/refs/heads/main/update.json"
 
 # 実行時のカレントディレクトリ(CWD)に依存させないためのアプリ基準ディレクトリ。
 # PyInstaller等でexe化されている場合はexeの場所、そうでなければこのスクリプトの場所を基準にする。
